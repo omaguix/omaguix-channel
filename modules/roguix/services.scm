@@ -10,20 +10,29 @@
 ;;; declared locked, and on the first start this service asks for its password
 ;;; on tty1 before the console logs in automatically. Account activation keeps
 ;;; a password set this way across reboots and reconfigures.
+;;;
+;;; roguix-machine-settings: the setup's host name, time zone, keyboard and
+;;; language (the Mac's, taken once) live in a data file that /etc/config.scm reads. Until a reconfigure builds
+;;; them into the system, this service applies them at every boot, before the
+;;; desktop session starts.
 (define-module (roguix services)
   #:use-module (gnu packages admin)
   #:use-module (gnu packages base)
   #:use-module (gnu packages fonts)
   #:use-module (gnu packages glib)
   #:use-module (gnu packages linux)
+  #:use-module (ice-9 match)
   #:use-module (gnu services)
   #:use-module (gnu services shepherd)
   #:use-module (guix gexp)
   #:use-module ((roguix integrations)
-                #:select (%roguix-host-settings-file roguix-setup))
+                #:select (roguix-setup))
   #:use-module (gnu packages bash)
   #:export (%roguix-account
             %roguix-console-font
+            %roguix-machine-settings-file
+            read-machine-settings
+            roguix-machine-settings-service-type
             roguix-grow-root-service-type
             roguix-first-boot-service-type
             roguix-session-script))
@@ -36,11 +45,13 @@
 ;; root partition and its ext4 this label.
 (define %root-label "Guix_image")
 
-;; Terminus 32 px on the text consoles, as for boot messages; its 512 glyphs
-;; cover the setup's keyboard layouts, which the kernel's built-in font does
-;; not.
+;; Terminus Bold 32 px on the text consoles, the face of the kernel's
+;; built-in TER16x32 used for boot messages, so the shutdown text keeps the
+;; boot's weight (the normal weight's thin strokes blur when the window scales
+;; the display). Its 512 glyphs cover the setup's keyboard layouts, which the
+;; kernel's built-in font does not.
 (define %roguix-console-font
-  (file-append font-terminus "/share/consolefonts/ter-v32n.psf.gz"))
+  (file-append font-terminus "/share/consolefonts/ter-v32b.psf.gz"))
 
 (define grow-root-program
   (program-file
@@ -176,10 +187,125 @@ if [ \"$(tty)\" = /dev/tty1 ] && [ -z \"$WAYLAND_DISPLAY\" ] \\
   set -a
   . /usr/share/omarchy/default/environment.d/10-omarchy-fcitx.conf
   set +a
-  # The launcher's optional guest language (roguix-host-settings).
-  case \" $(cat " %roguix-host-settings-file " 2>/dev/null) \" in
-    *' tryomarchy.locale=zh_TW.UTF-8 '*) export LANG=zh_TW.UTF-8 ;;
-  esac
   exec " (file-append dbus "/bin/dbus-run-session") " start-hyprland
 fi
 "))
+
+;; The first-start setup's answers (roguix-setup writes the file): an alist of
+;; host-name, timezone, timezone-follows-mac, keyboard-layout,
+;; keyboard-variant, console-keymap and locale, each a string; while the zone
+;; follows the Mac, roguix-timezone keeps timezone current. Data, never code: it is read, not loaded.
+(define %roguix-machine-settings-file "/var/lib/roguix/machine-settings.scm")
+
+(define (read-machine-settings)
+  "The machine settings as an alist, or '() when there are none yet."
+  (catch #t
+    (lambda ()
+      (if (file-exists? %roguix-machine-settings-file)
+          (match (call-with-input-file %roguix-machine-settings-file read)
+            ((((? symbol? keys) . (? string? values)) ...)
+             (map cons keys values))
+            (_ '()))
+          '()))
+    (const '())))
+
+(define (machine-settings-program built)
+  "Apply the settings file where it differs from BUILT, the settings this
+system was built with."
+  (program-file
+   "roguix-machine-settings"
+   #~(begin
+       (use-modules (ice-9 match) (ice-9 regex) (ice-9 textual-ports))
+
+       (define built '#$built)
+       (define desired
+         (catch #t
+           (lambda ()
+             (match (call-with-input-file #$%roguix-machine-settings-file read)
+               ((((? symbol? keys) . (? string? values)) ...)
+                (map cons keys values))
+               (_ '())))
+           (const '())))
+       (define (wanted key)
+         (let ((value (assq-ref desired key)))
+           (and value (not (equal? value (assq-ref built key))) value)))
+       (define (safe? value) (string-match "^[A-Za-z0-9_+./-]*$" value))
+
+       ;; Files under /etc are store links; replace them, never write through.
+       (define (replace-file file text)
+         (let ((staging (string-append file ".roguix")))
+           (call-with-output-file staging (lambda (port) (display text port)))
+           (chmod staging #o644)
+           (rename-file staging file)))
+
+       (let ((host-name (wanted 'host-name)))
+         (when (and host-name (string-match "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+                                            host-name))
+           (sethostname host-name)
+           (replace-file "/etc/hostname" (string-append host-name "\n"))
+           ;; Keep /etc/hosts resolving the name, or sudo waits on DNS.
+           (replace-file
+            "/etc/hosts"
+            (regexp-substitute/global
+             #f (string-append "\\<" (regexp-quote (assq-ref built 'host-name))
+                               "\\>")
+             (call-with-input-file "/etc/hosts" get-string-all)
+             'pre host-name 'post))))
+
+       (let ((zone (wanted 'timezone)))
+         (when (and zone (safe? zone) (not (string-contains zone "..")))
+           (let ((target (string-append #$tzdata "/share/zoneinfo/" zone)))
+             (when (file-exists? target)
+               (false-if-exception (delete-file "/etc/localtime.roguix"))
+               (symlink target "/etc/localtime.roguix")
+               (rename-file "/etc/localtime.roguix" "/etc/localtime")))))
+
+       (when (or (wanted 'keyboard-layout) (wanted 'keyboard-variant)
+                 (wanted 'console-keymap))
+         (let ((layout (or (assq-ref desired 'keyboard-layout) ""))
+               (variant (or (assq-ref desired 'keyboard-variant) ""))
+               (keymap (or (assq-ref desired 'console-keymap) "")))
+           (when (and (safe? layout) (safe? variant) (safe? keymap))
+             ;; Omarchy's Hyprland input reads the layout here.
+             (replace-file "/etc/vconsole.conf"
+                           (string-append "KEYMAP=" keymap "\n"
+                                          "XKBLAYOUT=" layout "\n"
+                                          "XKBVARIANT=" variant "\n"))
+             (unless (string-null? keymap)
+               (system* #$(file-append kbd "/bin/loadkeys") keymap)))))
+
+       ;; pam_env gives the login its LANG from /etc/environment.
+       (let ((locale (wanted 'locale)))
+         (when (and locale (safe? locale))
+           (replace-file
+            "/etc/environment"
+            (string-concatenate
+             (map (lambda (line) (string-append line "\n"))
+                  (cons (string-append "LANG=" locale)
+                        (filter (lambda (line)
+                                  (not (or (string-null? line)
+                                           (string-prefix? "LANG=" line))))
+                                (string-split
+                                 (call-with-input-file "/etc/environment"
+                                   get-string-all)
+                                 #\newline)))))))))))
+
+(define (machine-settings-shepherd-service built)
+  (list (shepherd-service
+         (provision '(roguix-machine-settings))
+         (requirement '(file-systems host-name))
+         (one-shot? #t)
+         (documentation "Apply the first-start settings a reconfigure has not
+built into this system yet.")
+         (start #~(lambda _
+                    (zero? (system* #$(machine-settings-program built))))))))
+
+;; The value: the settings alist the system is built with.
+(define roguix-machine-settings-service-type
+  (service-type
+   (name 'roguix-machine-settings)
+   (extensions
+    (list (service-extension shepherd-root-service-type
+                             machine-settings-shepherd-service)))
+   (description "Apply the first-start setup's host name, time zone,
+keyboard and language until a reconfigure builds them into the system.")))

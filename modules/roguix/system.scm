@@ -18,9 +18,11 @@
   #:use-module (roguix omarchy)
   #:use-module (roguix packages)
   #:use-module (roguix services)
+  #:use-module (roguix trust)
   #:export (roguix-operating-system
+            %roguix-reference-system
             %pinned-guix-root))
-(use-service-modules desktop docker sddm sound ssh xorg)
+(use-service-modules desktop docker linux sddm sound ssh xorg)
 (use-package-modules fonts gl linux package-management terminals
                      window-management xdisorg)
 
@@ -51,16 +53,15 @@
 ;;
 ;;   sudo roguix-reconfigure
 ;;
-;; Omarchy's install menus edit the same list. Everything else is the Roguix
-;; system in /etc/roguix, which this reuses as is.
+;; Omarchy's install menus edit the same list. The host name, time zone,
+;; keyboard and language come from the first-start setup, kept in
+;; /var/lib/roguix/machine-settings.scm; #:host-name, #:timezone,
+;; #:keyboard-layout, #:keyboard-variant and #:locale (e.g. \"pl_PL.utf8\")
+;; here override them. Everything else is the Roguix system in /etc/roguix,
+;; which this reuses as is.
 (use-modules (roguix system))
 
 (roguix-operating-system
- ;; BEGIN roguix setup
- #:host-name \"roguix\"
- #:timezone \"Etc/UTC\"
- #:keyboard-layout \"us\"
- ;; END roguix setup
  #:packages
  '(;; BEGIN roguix packages
    ;; END roguix packages
@@ -80,10 +81,6 @@
 ;; system as a GC root.
 (define %ungrafted-root "/var/guix/gcroots/roguix-ungrafted")
 
-;; Substitutes for Roguix's packages: guix publish on the author's server
-;; (docs/decisions/0002-roguix-substitute-server.md).
-(define %roguix-substitute-url "https://roguix.frolow.dev")
-
 ;; An operating system as a file-like object: its system derivation's output.
 (define-record-type <system-closure>
   (system-closure os)
@@ -94,14 +91,31 @@
                                                system target)
   (operating-system-derivation (system-closure-os closure)))
 
-(define* (roguix-operating-system #:key (packages '())
-                                  (host-name "roguix") (timezone "Etc/UTC")
-                                  (keyboard-layout "us") keyboard-variant)
-  "Return the Roguix system, adding PACKAGES, a list of package names.
-HOST-NAME, TIMEZONE, KEYBOARD-LAYOUT and KEYBOARD-VARIANT (XKB names) are the
-first-start setup's answers (roguix-setup)."
-  (let ((os (base-operating-system packages host-name timezone
-                                   keyboard-layout keyboard-variant)))
+(define (roguix-operating-system . options)
+  "Return the Roguix system, adding #:packages, a list of package names.
+#:host-name, #:timezone, #:keyboard-layout and #:keyboard-variant (XKB names)
+and #:locale (a Guix locale name such as \"zh_TW.utf8\") default to the
+first-start setup's answers (%roguix-machine-settings-file), then to the
+image's defaults."
+  (apply settings-operating-system (read-machine-settings) options))
+
+(define* (settings-operating-system settings #:key (packages '())
+                                    host-name timezone keyboard-layout
+                                    keyboard-variant locale)
+  "Return the Roguix system for SETTINGS, the machine settings alist."
+  (define (setting key)
+    (let ((value (assq-ref settings key)))
+      (and value (not (string-null? value)) value)))
+  (let* ((host-name (or host-name (setting 'host-name) "roguix"))
+         (timezone (or timezone (setting 'timezone) "Etc/UTC"))
+         (layout (or keyboard-layout (setting 'keyboard-layout) "us"))
+         (variant (or keyboard-variant
+                      (and (not keyboard-layout) (setting 'keyboard-variant))))
+         (locale (or locale (setting 'locale) "en_US.utf8"))
+         (os (base-operating-system packages host-name timezone layout
+                                    variant
+                                    (or (setting 'console-keymap) "")
+                                    locale)))
     (operating-system
       (inherit os)
       (services
@@ -110,17 +124,22 @@ first-start setup's answers (roguix-setup)."
                                    (system-closure os)))
              (operating-system-user-services os))))))
 
-(define (base-operating-system packages host-name timezone layout variant)
+(define (base-operating-system packages host-name timezone layout variant
+                               console-keymap locale)
   (operating-system
     (host-name host-name)
     (timezone timezone)
-    (locale "en_US.utf8")
-    ;; Traditional Chinese, the launcher's one optional guest language
-    ;; (tryomarchy.locale); the session sets LANG from it.
+    (locale locale)
+    ;; The image's optional languages (artifact.LOCALES): the first-start
+    ;; setup takes the Mac's (tryomarchy.locale) once. Defined here, so that
+    ;; choosing one does not rebuild the locales; Guix adds any other LOCALE.
+    ;; zh_CN.utf8 is one of %default-locale-definitions.
     (locale-definitions
-     (cons (locale-definition (name "zh_TW.utf8") (source "zh_TW")
-                              (charset "UTF-8"))
-           %default-locale-definitions))
+     (cons* (locale-definition (name "zh_TW.utf8") (source "zh_TW")
+                               (charset "UTF-8"))
+            (locale-definition (name "ko_KR.utf8") (source "ko_KR")
+                               (charset "UTF-8"))
+            %default-locale-definitions))
     (keyboard-layout (if variant
                          (keyboard-layout layout variant)
                          (keyboard-layout layout)))
@@ -200,6 +219,18 @@ first-start setup's answers (roguix-setup)."
                    (password "!")
                    (supplementary-groups '("wheel" "netdev" "audio" "video")))
                   %base-user-accounts))
+    ;; Omarchy's time zone menu runs without a terminal, where sudo cannot
+    ;; ask for the password; Omarchy lets wheel set the zone without one
+    ;; (etc/sudoers.d/omarchy-tzupdate), and so does this rule for its
+    ;; replacement, roguix-timezone, which checks the zone itself.
+    (sudoers-file
+     (plain-file "sudoers"
+                 (string-append
+                  (plain-file-content %sudoers-specification)
+                  "%wheel ALL=(root) NOPASSWD: "
+                  "/run/current-system/profile/bin/roguix-timezone "
+                  "^--select (Same as macOS|[A-Za-z0-9_+][A-Za-z0-9_+-]*"
+                  "(/[A-Za-z0-9_+][A-Za-z0-9_+-]*)*)$\n")))
 
     ;; Foot avoids the separate Kitty OpenGL-context workaround in the Arch
     ;; guest. Keep compositor rendering on VirGL, without a software override.
@@ -222,16 +253,33 @@ first-start setup's answers (roguix-setup)."
             ;; shell, seeded into the account at the first desktop login.
             (service roguix-omarchy-service-type)
             (service roguix-grow-root-service-type)
+            ;; The VM disk is attached with discard=unmap, so a trim gives
+            ;; deleted files' blocks back to the Mac. Hourly rather than
+            ;; Guix's weekly default: Shepherd's timer does not catch up on
+            ;; a run missed while the VM was closed, and ext4 skips groups
+            ;; already trimmed since the mount, so a run costs little.
+            (service fstrim-service-type
+                     (fstrim-configuration (schedule "0 * * * *")))
             (extra-special-file %pinned-guix-root (pinned-guix))
             (simple-service 'roguix-config activation-service-type
                             roguix-config-activation)
             (service roguix-first-boot-service-type)
+            ;; What this system is built with; the boot service applies the
+            ;; settings file only where it differs.
+            (service roguix-machine-settings-service-type
+                     `((host-name . ,host-name)
+                       (timezone . ,timezone)
+                       (keyboard-layout . ,layout)
+                       (keyboard-variant . ,(or variant ""))
+                       (console-keymap . ,console-keymap)
+                       (locale . ,locale)))
             (service roguix-host-settings-service-type)
             (service roguix-mac-share-service-type)
             (service roguix-clipboard-service-type)
             (service roguix-audio-service-type)
             (service roguix-camera-service-type)
             (service roguix-battery-service-type)
+            (service roguix-timezone-service-type)
             (service roguix-settings-service-type)
             ;; Omarchy's Hyprland input reads the layout from systemd's
             ;; vconsole.conf; Guix keeps it in keyboard-layout instead.
@@ -266,16 +314,16 @@ first-start setup's answers (roguix-setup)."
                         %desktop-services)
               ;; Roguix's own packages (Hyprland, Quickshell, Omarchy, the
               ;; VM agents) have no substitutes on Guix's servers; its server
-              ;; publishes them, signed with roguix.frolow.dev.pub, after
-              ;; Guix's own servers in the search order.
+              ;; publishes them, signed with its key, after Guix's own
+              ;; servers in the search order ((roguix trust)).
               (guix-service-type
                config => (guix-configuration
                           (inherit config)
                           (substitute-urls
                            (append (guix-configuration-substitute-urls config)
-                                   (list %roguix-substitute-url)))
+                                   (list (roguix-trust-substitute-url %roguix-trust))))
                           (authorized-keys
-                           (cons (local-file "roguix.frolow.dev.pub")
+                           (cons (roguix-trust-substitute-key %roguix-trust)
                                  (guix-configuration-authorized-keys config)))))
               ;; pipewire-pulse serves the PulseAudio socket; pactl (the audio
               ;; bridge's tool) must never start a real PulseAudio daemon.
@@ -309,7 +357,15 @@ first-start setup's answers (roguix-setup)."
                               ;; could no longer start.
                               (shepherd-requirement
                                (cons* 'roguix-first-boot 'roguix-mac-share
+                                      'roguix-machine-settings
                                       'elogind
                                       (mingetty-configuration-shepherd-requirement
                                        config))))
                              config)))))))
+
+;; The image's system with no extra packages and the default host settings,
+;; independent of any machine's settings file: what omaguix/omaguix's CI
+;; builds substitutes for, the same derivation wherever it is evaluated.
+;; Defined last: it calls the procedures above when the module loads.
+(define %roguix-reference-system
+  (settings-operating-system '()))

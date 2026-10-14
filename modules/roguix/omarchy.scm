@@ -1,4 +1,4 @@
-;;; Roguix — the Omarchy 4 desktop on Guix System.
+;;; Omaguix — the Omarchy 4 desktop on Guix System.
 ;;;
 ;;; Omarchy 4 ("Quattro") is installed like the Arch guest installs it: the
 ;;; pinned upstream tree as a package at /usr/share/omarchy (OMARCHY_PATH's
@@ -39,6 +39,7 @@
   #:use-module (gnu packages linux)
   #:use-module (gnu packages ncurses)
   #:use-module (gnu packages networking)
+  #:use-module (gnu packages perl)
   #:use-module (gnu packages python)
   #:use-module (gnu packages qt)
   #:use-module (gnu packages terminals)
@@ -49,6 +50,8 @@
   #:use-module (gnu system pam)
   #:use-module (roguix apps)
   #:use-module (roguix packages)
+  #:use-module (roguix trust)
+  #:use-module (roguix ttfx)
   #:export (omarchy
             font-jetbrains-mono-nerd
             roguix-omarchy-compat
@@ -67,7 +70,31 @@
               (file-name (git-file-name name version))
               (sha256
                (base32
-                "0djxrwz0h8nbisy5j3xdvkicj6v0kl12qxc34dvakscgw0rp3jwy"))))
+                "0djxrwz0h8nbisy5j3xdvkicj6v0kl12qxc34dvakscgw0rp3jwy"))
+              ;; Omarchy #13418 (6762769b, after 4.0.4): menu and panel
+              ;; bindings reach the shell as Hyprland global shortcuts
+              ;; instead of a qs IPC client that omarchy-shell kills on its
+              ;; timeout, which lost or delayed Super+Space. The build fails
+              ;; if the patch no longer applies; remove it once the pin
+              ;; includes 6762769b. The VM has no Linux power profile
+              ;; driver: as in Try Omarchy, the power menu and panel show
+              ;; one profile, managed by macOS. The audio scripts parse
+              ;; pactl, which a Chinese or Korean session translates, so
+              ;; they read it in the C locale until Omarchy does. The
+              ;; background's name is title-cased as UTF-8, not as bytes.
+              ;; A theme change stages the store's theme as the owner's, so
+              ;; it can replace the current theme (a Guix-only problem).
+              ;; The low-battery warning closes once the battery recovers.
+              ;; All but the power profile and theme staging patches differ
+              ;; from Try Omarchy: guest/guix/README.md, "Differences from
+              ;; Try Omarchy".
+              (patches
+               (list (local-file "omarchy-global-shortcuts.patch")
+                     (local-file "omarchy-macos-power-profile.patch")
+                     (local-file "omarchy-audio-c-locale.patch")
+                     (local-file "omarchy-theme-bg-utf8.patch")
+                     (local-file "omarchy-theme-set-store-modes.patch")
+                     (local-file "omarchy-battery-warning-dismiss.patch")))))
     (build-system copy-build-system)
     (arguments
      (list
@@ -81,6 +108,7 @@
             ;; the AUR: the menu's Install, Remove and Update entries are
             ;; Guix's (omarchy-menu.py), Omarchy's package helpers call
             ;; roguix-pkg, and its Arch-only package commands are gone.
+            ;; See guest/guix/README.md, "Differences from Try Omarchy".
             (lambda* (#:key native-inputs inputs #:allow-other-keys)
               (let* ((omarchy (string-append #$output "/share/omarchy"))
                      (bin (string-append omarchy "/bin"))
@@ -100,7 +128,7 @@
                    (let ((file (string-append bin "/" (car helper))))
                      (call-with-output-file file
                        (lambda (port)
-                         (format port "#!~a~%# Roguix: ~a~%~a~%"
+                         (format port "#!~a~%# Omaguix: ~a~%~a~%"
                                  bash (cadr helper) (caddr helper))))
                      (chmod file #o555)))
                  '(("omarchy-pkg-add" "add Guix packages to /etc/config.scm"
@@ -115,12 +143,42 @@
                     "exec roguix-pkg pick-add")
                    ("omarchy-pkg-remove" "choose Guix packages to remove"
                     "exec roguix-pkg pick-remove")))
-                ;; Web apps need a Chromium-family --app window; Roguix's
+;; Try Omarchy's microphone helper: Omarchy's moves every
+                ;; recording to the chosen source, including the audio
+                ;; bridge's own module-remap-source stream, which then
+                ;; records from itself and the Mac microphone falls silent.
+                (let ((file (string-append bin "/omarchy-audio-input-set-default")))
+                  (copy-file #$(local-file "audio-input-set-default") file)
+                  (chmod file #o755)
+                  (substitute* file (("^#!/bin/bash") (string-append "#!" bash)))
+                  (chmod file #o555))
+                ;; Web apps need a Chromium-family --app window; Omaguix's
                 ;; browser is LibreWolf, so they open in a new browser window.
+                ;; See guest/guix/README.md, "Differences from Try Omarchy".
                 (let ((file (string-append bin "/omarchy-launch-webapp")))
                   (call-with-output-file file
                     (lambda (port)
-                      (format port "#!~a~%# Roguix: open a web app in a new window of the default browser.~%exec omarchy-launch-browser --new-window \"$1\"~%" bash)))
+                      (format port "#!~a~%# Omaguix: open a web app in a new window of the default browser.~%exec omarchy-launch-browser --new-window \"$1\"~%" bash)))
+                  (chmod file #o555))
+                ;; Omarchy's time zone menu calls timedatectl. Omaguix's
+                ;; lists "Same as macOS" first while the Mac's zone is
+                ;; known (Try Omarchy 5cebb9b): choosing it follows the Mac
+                ;; again, any zone fixes it. system.scm's sudoers allows
+                ;; exactly this command without a password, as Omarchy does
+                ;; for timedatectl.
+                ;; See guest/guix/README.md, "Differences from Try Omarchy".
+                (let ((file (string-append bin "/omarchy-menu-timezone")))
+                  (call-with-output-file file
+                    (lambda (port)
+                      (format port "#!~a
+# Omaguix: choose a fixed time zone, or follow the Mac's.
+set -e
+helper=/run/current-system/profile/bin/roguix-timezone
+timezone=$({ $helper --mirror-label 2>/dev/null || true; $helper --list; } | omarchy-menu-select \"Set timezone\" -- --width 520 --maxheight 520) || exit 1
+sudo -n /run/current-system/profile/bin/roguix-timezone --select \"$timezone\"
+omarchy-shell -q omarchy.clock refresh
+omarchy-notification-send \"Timezone is now set to $timezone\"
+" bash)))
                   (chmod file #o555))
                 ;; Desktop files live in Guix profiles, not /usr.
                 (substitute* (string-append bin "/omarchy-launch-browser")
@@ -130,6 +188,40 @@
                 (substitute* (string-append omarchy "/shell/plugins/menu/MenuModel.js")
                   (("pacman -Qq; LC_ALL=C pacman -Qi") "roguix-pkg list; true")
                   (("pacman -Q \"[$]1\"") "roguix-pkg present \"$1\""))
+                ;; When the guard script ends, Menu.qml's guardProc.onExited
+                ;; recreates every row even if no `when:'/`checked:' result
+                ;; changed, and a click pressed on a row just before is lost
+                ;; with it. Rebuild only on a change. Derived from Omarchy
+                ;; c668141e (unchanged on master 988f44ea); remove once
+                ;; Omarchy takes the fix.
+                ;; See guest/guix/README.md, "Differences from Try Omarchy".
+                (let ((qml (string-append omarchy "/shell/plugins/menu/Menu.qml")))
+                  (substitute* qml
+                    (("root\\.whenResults = nextWhen")
+                     (string-append
+                      "var guardsChanged = JSON.stringify(nextWhen) !== JSON.stringify(root.whenResults)\n"
+                      "          || JSON.stringify(nextChecked) !== JSON.stringify(root.checkedResults)\n"
+                      "      root.whenResults = nextWhen"))
+                    (("^      if \\(root\\.opened\\) root\\.rebuildDisplay\\(\\)")
+                     "      if (root.opened && guardsChanged) root.rebuildDisplay()"))
+                  ;; substitute* does not fail when nothing matches.
+                  (invoke "grep" "-q" "root.opened && guardsChanged" qml))
+;; Try Omarchy 0c9817d: the mirrored Mac's charge state is
+                ;; authoritative. UPower can report zero watts or no estimate
+                ;; for a while after the Mac's AC changes, and the power panel
+                ;; then showed a charging Mac as held at a charge limit.
+                (let ((model (string-append omarchy
+                                            "/shell/plugins/panels/power/Model.js")))
+                  (substitute* model
+                    (("^  if \\(d\\.state !== s\\.Charging \\|\\| fraction >= 0\\.99\\) return false")
+                     (string-append
+                      "  // The mirrored Mac state is authoritative. UPower can temporarily report\n"
+                      "  // zero watts or no estimate after AC changes, even while charging.\n"
+                      "  return false"))
+                    (("^  return Number\\(d\\.changeRate .*") ""))
+                  (invoke "grep" "-q" "The mirrored Mac state is authoritative" model)
+                  (when (zero? (system* "grep" "-q" "d.changeRate" model))
+                    (error "Model.js still estimates a held charge" model)))
                 ;; Guix's Qt 6.9 QML parser rejects `transient', a reserved
                 ;; word in its grammar, as a variable name, and Quickshell then
                 ;; skips the whole notification service.
@@ -138,10 +230,22 @@
                   (("var transient = ") "var isTransient = ")
                   (("\\{ transient = ") "{ isTransient = ")
                   (("^( *)transient = !!" _ indent) (string-append indent "isTransient = !!"))
-                  (("return transient [|][|]") "return isTransient ||")))))
+                  (("return transient [|][|]") "return isTransient ||"))
+                ;; The screensaver is opt-in (roguix-omarchy-seed turns
+                ;; Omarchy's screensaver-off toggle on) and runs at 30 fps,
+                ;; not 120: every frame is redrawn by the terminal, copied
+                ;; through virtio-gpu and composited by macOS, all on the
+                ;; Mac's CPU and battery, and a text animation stays smooth
+                ;; at 30.
+                ;; See guest/guix/README.md, "Differences from Try Omarchy".
+                (let ((screensaver (string-append bin "/omarchy-screensaver")))
+                  (substitute* screensaver
+                    (("--frame-rate 120 ") "--frame-rate 30 "))
+                  (invoke "grep" "-q" "-e" "--frame-rate 30 " screensaver)))))
           (add-after 'install 'use-roguix-logo
             ;; omarchy-show-logo and friends print logo.txt: say GUIX, in
             ;; Omarchy's own block lettering, instead of OMARCHY.
+            ;; See guest/guix/README.md, "Differences from Try Omarchy".
             (lambda _
               (copy-file #$(local-file "roguix-logo.txt")
                          (string-append #$output "/share/omarchy/logo.txt"))))
@@ -189,6 +293,7 @@ configuration, Quickshell desktop shell, themes and helper commands.")
 ;; packages, LibreWolf standing in for Chromium, and (roguix apps) for those
 ;; Guix lacks. Not provided: LibreOffice, Pinta, LocalSend, Signal, Obsidian;
 ;; docs/omarchy-packages.md lists every difference from Omarchy's list.
+;; See guest/guix/README.md, "Differences from Try Omarchy".
 (define %omarchy-applications
   (append
    (map specification->package
@@ -202,9 +307,9 @@ configuration, Quickshell desktop shell, themes and helper commands.")
           "xdg-desktop-portal" "xdg-desktop-portal-gtk"
           ;; The Secret Service; Omarchy's default keyring has no password.
           "gnome-keyring"
-          ;; Omarchy runs fcitx5 for compose keys; Chewing and Noto CJK back
-          ;; the optional Traditional Chinese language.
-          "fcitx5" "fcitx5-chewing" "fcitx5-gtk"
+          ;; Omarchy runs fcitx5 for compose keys; Chewing, Hangul and Noto
+          ;; CJK back the optional Chinese and Korean languages.
+          "fcitx5" "fcitx5-chewing" "fcitx5-hangul" "fcitx5-gtk"
           "font-google-noto-sans-cjk"))
    (list lazygit-bin lazydocker-bin gum-bin dua-bin cliamp-bin
          fastfetch-without-zfs obs-without-vlc fcitx5-qt6)))
@@ -212,14 +317,7 @@ configuration, Quickshell desktop shell, themes and helper commands.")
 ;;; Compatibility commands for Omarchy's Arch assumptions, plus Try Omarchy's
 ;;; xdg-terminal-exec and the per-user seed.
 
-;;; The roguix channel: Roguix's modules, published from try-roguix
-;;; (guest/guix/publish-channel) and signed with the channel key; Guix's
-;;; channel introduction model authenticates each commit from the first.
-(define %roguix-channel-url "https://github.com/rofrol/roguix-channel")
-(define %roguix-channel-introduction "bcc938512706d19de86dd8c6f50853fa80b063b8")
-(define %roguix-channel-signer "7D1A 8B40 0C26 0998 097F  63E5 28B8 3B16 11FA 815E")
-
-;; Roguix's commands never compile in the VM unless asked: packages come from
+;; Omaguix's commands never compile in the VM unless asked: packages come from
 ;; roguix.frolow.dev and Guix's servers, and --max-jobs=0 still lets Guix
 ;; build its local derivations (configuration, profiles, grafts) but refuses
 ;; any other build at once instead of compiling for hours.
@@ -284,7 +382,7 @@ while arguments and arguments[0].startswith('--'):
     if option == '--':
         break
     if option != '--pdeathsig' or not arguments:
-        sys.exit(f'setpriv: Roguix supports only --pdeathsig, not {option}')
+        sys.exit(f'setpriv: Omaguix supports only --pdeathsig, not {option}')
     name = arguments.pop(0).upper()
     number = int(name) if name.isdigit() else signal.Signals[
         name if name.startswith('SIG') else 'SIG' + name]
@@ -355,7 +453,7 @@ exit 0
 /var/guix/gcroots/roguix-guix/bin/guix system reconfigure $gate \\
   -L /etc/roguix/modules /etc/config.scm \"$@\" || gate_failed $?
 "))
-              ;; Update Roguix from its signed channel (docs/decisions/0004):
+              ;; Update Omaguix from its signed channel (docs/decisions/0004):
               ;; fetch it, authenticate every new commit from the channel
               ;; introduction, require the same Guix pin as this image, then
               ;; reconfigure /etc/config.scm with the channel's modules. The
@@ -369,16 +467,20 @@ set -e
 git=" #$(file-append git "/bin/git") "
 guix=/var/guix/gcroots/roguix-guix/bin/guix
 dir=/var/lib/roguix/channel
-[ -d \"$dir/.git\" ] || $git clone --quiet --no-checkout " #$%roguix-channel-url " \"$dir\"
+url=" #$(roguix-trust-channel-url %roguix-trust) "
+[ -d \"$dir/.git\" ] || $git clone --quiet --no-checkout \"$url\" \"$dir\"
+# A checkout cloned before the channel moved follows its new URL.
+$git -C \"$dir\" remote set-url origin \"$url\"
 $git -C \"$dir\" fetch --quiet origin main keyring
 # --end takes a commit, not a branch name.
 head=$($git -C \"$dir\" rev-parse origin/main)
 ( cd \"$dir\" && $guix git authenticate --keyring=origin/keyring --end=\"$head\" \\
-    " #$%roguix-channel-introduction " '" #$%roguix-channel-signer "' )
+    " #$(roguix-trust-channel-introduction %roguix-trust) " \\
+    '" #$(roguix-trust-channel-signer %roguix-trust) "' )
 $git -C \"$dir\" checkout --quiet --detach \"$head\"
 if ! cmp -s \"$dir/modules/roguix/guix-commit\" /etc/roguix/modules/roguix/guix-commit; then
-  echo 'roguix-update: this Roguix release needs a newer Guix than this VM has;' >&2
-  echo 'reset Roguix from the latest Try Roguix app to get it.' >&2
+  echo 'roguix-update: this Omaguix release needs a newer Guix than this VM has;' >&2
+  echo 'reset Omaguix from the latest Try Omaguix app to get it.' >&2
   exit 1
 fi
 $guix system reconfigure $gate -L \"$dir/modules\" /etc/config.scm \"$@\" \\
@@ -405,7 +507,7 @@ calls, a busctl subset over gdbus, and the Omarchy per-user seed.")
 ;; the host bridges and the per-session sound server (see integrations.scm).
 (define hypr-vm-lua
   (plain-file "hypr-vm.lua" "\
--- Roguix VM integration, loaded from ~/.config/hypr/monitors.lua.
+-- Omaguix VM integration, loaded from ~/.config/hypr/monitors.lua.
 local function host_setting(expected)
   local file = io.open(\"/run/roguix/host-settings\", \"r\")
   if not file then return false end
@@ -455,10 +557,13 @@ end)
                                (list omarchy roguix-omarchy-compat quickshell-0.3
                                     foot jq socat inotify-tools hyprsunset ncurses
                                     fzf imv mpv
+                                    ;; Omarchy's menus, clipboard capture and
+                                    ;; name title-casing call perl.
+                                    perl
                                     fontconfig procps gawk util-linux curl
                                     `(,gtk+ "bin") libnotify xdg-user-dirs
                                     qtimageformats yaru-theme font-liberation
-                                    font-jetbrains-mono-nerd)
+                                    font-jetbrains-mono-nerd ttfx)
                                %omarchy-applications)))))
    (default-value #f)
    (description "Install Omarchy 4's desktop, shell and theme.")))
