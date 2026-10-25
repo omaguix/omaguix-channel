@@ -1,26 +1,31 @@
-;;; Roguix — the guest's operating system.
+;;; Omaguix — the guest's operating system.
 ;;;
-;;; `roguix-operating-system' is the whole system; guest/guix/system.scm
+;;; `omaguix-operating-system' is the whole system; guest/guix/system.scm
 ;;; builds the image from it with no extra packages. In the guest,
 ;;; /etc/config.scm calls it with the owner's package list (edited by hand or
-;;; by Omarchy's install menus through roguix-pkg), and
-;;; `sudo roguix-reconfigure' applies it with the Guix that built the image.
-(define-module (roguix system)
+;;; by Omarchy's install menus through omaguix-pkg), and
+;;; `sudo omaguix-reconfigure' applies it with the Guix that built the image.
+(define-module (omaguix system)
   #:use-module (gnu)
   #:use-module (gnu system linux-initrd)
   #:use-module (gnu system locale)
   #:use-module (guix gexp)
   #:use-module (guix grafts)
+  #:use-module ((guix store) #:select (direct-store-path?))
   #:use-module (ice-9 match)
+  #:use-module (ice-9 regex)
+  #:use-module (ice-9 textual-ports)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
-  #:use-module (roguix integrations)
-  #:use-module (roguix omarchy)
-  #:use-module (roguix packages)
-  #:use-module (roguix services)
-  #:export (roguix-operating-system
+  #:use-module (omaguix integrations)
+  #:use-module (omaguix omarchy)
+  #:use-module (omaguix packages)
+  #:use-module (omaguix services)
+  #:use-module (omaguix trust)
+  #:export (omaguix-operating-system
+            %omaguix-reference-system
             %pinned-guix-root))
-(use-service-modules desktop docker sddm sound ssh xorg)
+(use-service-modules desktop docker linux sddm sound ssh xorg)
 (use-package-modules fonts gl linux package-management terminals
                      window-management xdisorg)
 
@@ -28,61 +33,96 @@
 ;; commit run by `guix time-machine'; the image keeps it as a GC root, and in
 ;; the guest the system reuses that same store item instead of rebuilding it,
 ;; so reconfiguring with it computes the very derivations the image was built
-;; from and only fetches what the owner adds.
-(define %pinned-guix-root "/var/guix/gcroots/roguix-guix")
+;; from and only fetches what the owner adds. omaguix-update moves the system
+;; to a release's Guix by running that Guix with OMAGUIX_GUIX set to it, which
+;; pins it instead (docs/decisions/0007).
+(define %pinned-guix-root "/var/guix/gcroots/omaguix-guix")
 (define (pinned-guix)
-  (if (file-exists? %pinned-guix-root)
-      (readlink %pinned-guix-root)
-      (current-guix)))
+  (match (getenv "OMAGUIX_GUIX")
+    (#f (if (file-exists? %pinned-guix-root)
+            (readlink %pinned-guix-root)
+            (current-guix)))
+    ((? direct-store-path? guix) guix)
+    (other (error "OMAGUIX_GUIX is not a store item:" other))))
 
 ;; Files that define this system; build and test tooling is left out.
-(define (roguix-source? file stat)
+(define (omaguix-source? file stat)
   (or (eq? 'directory (stat:type stat))
       (member (basename file) '("system.scm"))
-      (string-contains file "/modules/roguix/")))
+      (string-contains file "/modules/omaguix/")))
+
+;; The commit of the channel's main this system was built from, kept as
+;; /etc/omaguix/channel-commit: omaguix-update moves only to a main that
+;; descends from it (docs/decisions/0007). build.py (the image) and
+;; omaguix-update set OMAGUIX_CHANNEL_COMMIT; any other reconfigure, such as
+;; omaguix-reconfigure's, keeps the running system's record.
+(define %channel-commit-file "/etc/omaguix/channel-commit")
+(define (channel-commit)
+  (let ((commit (or (getenv "OMAGUIX_CHANNEL_COMMIT")
+                    (and (file-exists? %channel-commit-file)
+                         (string-trim-both
+                          (call-with-input-file %channel-commit-file
+                            get-string-all))))))
+    (cond ((not commit) #f)
+          ((string-match "^[0-9a-f]{40}$" commit) commit)
+          (else (error "not a channel commit:" commit)))))
+
+(define (omaguix-sources)
+  (let ((sources (local-file "../.." "omaguix-sources"
+                             #:recursive? #t
+                             #:select? omaguix-source?))
+        (commit (channel-commit)))
+    (if commit
+        (computed-file "omaguix-sources"
+                       (with-imported-modules '((guix build utils))
+                         #~(begin
+                             (use-modules (guix build utils))
+                             (copy-recursively #$sources #$output
+                                               #:log (%make-void-port "w"))
+                             (call-with-output-file
+                                 (string-append #$output "/channel-commit")
+                               (lambda (port)
+                                 (display #$commit port)
+                                 (newline port))))))
+        sources)))
 
 ;; Installed as /etc/config.scm on first boot, then the owner's to edit.
 (define config-template
   (plain-file "config.scm" "\
-;; Roguix: this machine's system configuration.
+;; Omaguix: this machine's system configuration.
 ;;
 ;; Add programs by their Guix package names (`guix search NAME' finds them),
 ;; then apply the change with:
 ;;
-;;   sudo roguix-reconfigure
+;;   sudo omaguix-reconfigure
 ;;
-;; Omarchy's install menus edit the same list. Everything else is the Roguix
-;; system in /etc/roguix, which this reuses as is.
-(use-modules (roguix system))
+;; Omarchy's install menus edit the same list. The host name, time zone,
+;; keyboard and language come from the first-start setup, kept in
+;; /var/lib/omaguix/machine-settings.scm; #:host-name, #:timezone,
+;; #:keyboard-layout, #:keyboard-variant and #:locale (e.g. \"pl_PL.utf8\")
+;; here override them. Everything else is the Omaguix system in /etc/omaguix,
+;; which this reuses as is.
+(use-modules (omaguix system))
 
-(roguix-operating-system
- ;; BEGIN roguix setup
- #:host-name \"roguix\"
- #:timezone \"Etc/UTC\"
- #:keyboard-layout \"us\"
- ;; END roguix setup
+(omaguix-operating-system
  #:packages
- '(;; BEGIN roguix packages
-   ;; END roguix packages
+ '(;; BEGIN omaguix packages
+   ;; END omaguix packages
    ))
 "))
 
-(define roguix-config-activation
+(define omaguix-config-activation
   #~(unless (file-exists? "/etc/config.scm")
       (copy-file #$config-template "/etc/config.scm")
       (chmod "/etc/config.scm" #o644)))
 
 ;; Guix builds every package first without grafts (its security fixes applied
 ;; to finished binaries) and then grafts it. The image holds only grafted
-;; items, so a reconfigure, which grafts again, would rebuild Roguix's own
+;; items, so a reconfigure, which grafts again, would rebuild Omaguix's own
 ;; packages (Hyprland, Quickshell), which have no substitutes, and download
 ;; the ungrafted Guix packages. The image therefore keeps the whole ungrafted
 ;; system as a GC root.
-(define %ungrafted-root "/var/guix/gcroots/roguix-ungrafted")
-
-;; Substitutes for Roguix's packages: guix publish on the author's server
-;; (docs/decisions/0002-roguix-substitute-server.md).
-(define %roguix-substitute-url "https://roguix.frolow.dev")
+(define %ungrafted-root "/var/guix/gcroots/omaguix-ungrafted")
 
 ;; An operating system as a file-like object: its system derivation's output.
 (define-record-type <system-closure>
@@ -94,14 +134,31 @@
                                                system target)
   (operating-system-derivation (system-closure-os closure)))
 
-(define* (roguix-operating-system #:key (packages '())
-                                  (host-name "roguix") (timezone "Etc/UTC")
-                                  (keyboard-layout "us") keyboard-variant)
-  "Return the Roguix system, adding PACKAGES, a list of package names.
-HOST-NAME, TIMEZONE, KEYBOARD-LAYOUT and KEYBOARD-VARIANT (XKB names) are the
-first-start setup's answers (roguix-setup)."
-  (let ((os (base-operating-system packages host-name timezone
-                                   keyboard-layout keyboard-variant)))
+(define (omaguix-operating-system . options)
+  "Return the Omaguix system, adding #:packages, a list of package names.
+#:host-name, #:timezone, #:keyboard-layout and #:keyboard-variant (XKB names)
+and #:locale (a Guix locale name such as \"zh_TW.utf8\") default to the
+first-start setup's answers (%omaguix-machine-settings-file), then to the
+image's defaults."
+  (apply settings-operating-system (read-machine-settings) options))
+
+(define* (settings-operating-system settings #:key (packages '())
+                                    host-name timezone keyboard-layout
+                                    keyboard-variant locale)
+  "Return the Omaguix system for SETTINGS, the machine settings alist."
+  (define (setting key)
+    (let ((value (assq-ref settings key)))
+      (and value (not (string-null? value)) value)))
+  (let* ((host-name (or host-name (setting 'host-name) "omaguix"))
+         (timezone (or timezone (setting 'timezone) "Etc/UTC"))
+         (layout (or keyboard-layout (setting 'keyboard-layout) "us"))
+         (variant (or keyboard-variant
+                      (and (not keyboard-layout) (setting 'keyboard-variant))))
+         (locale (or locale (setting 'locale) "en_US.utf8"))
+         (os (base-operating-system packages host-name timezone layout
+                                    variant
+                                    (or (setting 'console-keymap) "")
+                                    locale)))
     (operating-system
       (inherit os)
       (services
@@ -110,26 +167,31 @@ first-start setup's answers (roguix-setup)."
                                    (system-closure os)))
              (operating-system-user-services os))))))
 
-(define (base-operating-system packages host-name timezone layout variant)
+(define (base-operating-system packages host-name timezone layout variant
+                               console-keymap locale)
   (operating-system
     (host-name host-name)
     (timezone timezone)
-    (locale "en_US.utf8")
-    ;; Traditional Chinese, the launcher's one optional guest language
-    ;; (tryomarchy.locale); the session sets LANG from it.
+    (locale locale)
+    ;; The image's optional languages (artifact.LOCALES): the first-start
+    ;; setup takes the Mac's (tryomarchy.locale) once. Defined here, so that
+    ;; choosing one does not rebuild the locales; Guix adds any other LOCALE.
+    ;; zh_CN.utf8 is one of %default-locale-definitions.
     (locale-definitions
-     (cons (locale-definition (name "zh_TW.utf8") (source "zh_TW")
-                              (charset "UTF-8"))
-           %default-locale-definitions))
+     (cons* (locale-definition (name "zh_TW.utf8") (source "zh_TW")
+                               (charset "UTF-8"))
+            (locale-definition (name "ko_KR.utf8") (source "ko_KR")
+                               (charset "UTF-8"))
+            %default-locale-definitions))
     (keyboard-layout (if variant
                          (keyboard-layout layout variant)
                          (keyboard-layout layout)))
     (kernel linux-libre)
     (firmware '())
-    ;; /dev/video42 for the Mac camera (roguix-camera-service-type) and the
-    ;; mirrored Mac battery (roguix-battery-service-type).
+    ;; /dev/video42 for the Mac camera (omaguix-camera-service-type) and the
+    ;; mirrored Mac battery (omaguix-battery-service-type).
     (kernel-loadable-modules (list v4l2loopback-linux-module
-                                   roguix-battery-module))
+                                   omaguix-battery-module))
     (initrd-modules (cons* "virtio_gpu" "virtio_console"
                            (base-initrd-modules linux-libre)))
     ;; Guix builds the keyboard layout into the initrd, for typing a LUKS
@@ -152,7 +214,7 @@ first-start setup's answers (roguix-setup)."
     ;; Terminus 16x32 is small; at 1920x1080 scaled up it was too large. The
     ;; text console uses 2560x1440, outside the EDID's list, so M asks the
     ;; kernel for CVT timings. Hyprland sets its own mode from the window
-    ;; (roguix-display-sync).
+    ;; (omaguix-display-sync).
     (kernel-arguments (cons* "console=hvc0" "fbcon=font:TER16x32"
                              "video=Virtual-1:2560x1440M"
                              %default-kernel-arguments))
@@ -192,64 +254,90 @@ first-start setup's answers (roguix-setup)."
                    (home-directory "/root")
                    (password "!"))
                   ;; No password ships in the image: the account starts locked
-                  ;; and roguix-first-boot asks for one on the first start.
+                  ;; and omaguix-first-boot asks for one on the first start.
                   (user-account
-                   (name %roguix-account)
+                   (name %omaguix-account)
                    (uid 1000)
                    (group "users")
                    (password "!")
                    (supplementary-groups '("wheel" "netdev" "audio" "video")))
                   %base-user-accounts))
+    ;; Omarchy's time zone menu runs without a terminal, where sudo cannot
+    ;; ask for the password; Omarchy lets wheel set the zone without one
+    ;; (etc/sudoers.d/omarchy-tzupdate), and so does this rule for its
+    ;; replacement, omaguix-timezone, which checks the zone itself.
+    (sudoers-file
+     (plain-file "sudoers"
+                 (string-append
+                  (plain-file-content %sudoers-specification)
+                  "%wheel ALL=(root) NOPASSWD: "
+                  "/run/current-system/profile/bin/omaguix-timezone "
+                  "^--select (Same as macOS|[A-Za-z0-9_+][A-Za-z0-9_+-]*"
+                  "(/[A-Za-z0-9_+][A-Za-z0-9_+-]*)*)$\n")))
 
     ;; Foot avoids the separate Kitty OpenGL-context workaround in the Arch
     ;; guest. Keep compositor rendering on VirGL, without a software override.
     (packages (append (list hyprland-0.56 xdg-desktop-portal-hyprland-0.56
-                            roguix-display-sync
+                            omaguix-display-sync
                             foot wofi font-dejavu mesa-utils)
                       (map specification->package packages)
                       %base-packages))
     (services
      (cons* ;; The same definitions for in-guest reconfigure and rollback, so they
             ;; never fall back to the pinned checkout's broken Hyprland 0.55.4:
-            ;;   sudo guix system reconfigure -L /etc/roguix/modules \
-            ;;     /etc/roguix/system.scm
-            (simple-service 'roguix-sources etc-service-type
-                            `(("roguix"
-                               ,(local-file "../.." "roguix-sources"
-                                            #:recursive? #t
-                                            #:select? roguix-source?))))
+            ;;   sudo guix system reconfigure -L /etc/omaguix/modules \
+            ;;     /etc/omaguix/system.scm
+            (simple-service 'omaguix-sources etc-service-type
+                            `(("omaguix" ,(omaguix-sources))))
             ;; Omarchy 4's desktop: its Hyprland configuration and Quickshell
             ;; shell, seeded into the account at the first desktop login.
-            (service roguix-omarchy-service-type)
-            (service roguix-grow-root-service-type)
+            (service omaguix-omarchy-service-type)
+            (service omaguix-grow-root-service-type)
+            ;; The VM disk is attached with discard=unmap, so a trim gives
+            ;; deleted files' blocks back to the Mac. Hourly rather than
+            ;; Guix's weekly default: Shepherd's timer does not catch up on
+            ;; a run missed while the VM was closed, and ext4 skips groups
+            ;; already trimmed since the mount, so a run costs little.
+            (service fstrim-service-type
+                     (fstrim-configuration (schedule "0 * * * *")))
             (extra-special-file %pinned-guix-root (pinned-guix))
-            (simple-service 'roguix-config activation-service-type
-                            roguix-config-activation)
-            (service roguix-first-boot-service-type)
-            (service roguix-host-settings-service-type)
-            (service roguix-mac-share-service-type)
-            (service roguix-clipboard-service-type)
-            (service roguix-audio-service-type)
-            (service roguix-camera-service-type)
-            (service roguix-battery-service-type)
-            (service roguix-settings-service-type)
+            (simple-service 'omaguix-config activation-service-type
+                            omaguix-config-activation)
+            (service omaguix-first-boot-service-type)
+            ;; What this system is built with; the boot service applies the
+            ;; settings file only where it differs.
+            (service omaguix-machine-settings-service-type
+                     `((host-name . ,host-name)
+                       (timezone . ,timezone)
+                       (keyboard-layout . ,layout)
+                       (keyboard-variant . ,(or variant ""))
+                       (console-keymap . ,console-keymap)
+                       (locale . ,locale)))
+            (service omaguix-host-settings-service-type)
+            (service omaguix-mac-share-service-type)
+            (service omaguix-clipboard-service-type)
+            (service omaguix-audio-service-type)
+            (service omaguix-camera-service-type)
+            (service omaguix-battery-service-type)
+            (service omaguix-timezone-service-type)
+            (service omaguix-settings-service-type)
             ;; Omarchy's Hyprland input reads the layout from systemd's
             ;; vconsole.conf; Guix keeps it in keyboard-layout instead.
-            (simple-service 'roguix-vconsole etc-service-type
+            (simple-service 'omaguix-vconsole etc-service-type
                             `(("vconsole.conf"
                                ,(plain-file "vconsole.conf"
                                             (string-append
                                              "XKBLAYOUT=" layout "\n"
                                              "XKBVARIANT=" (or variant "")
                                              "\n")))))
-            (service roguix-touch-id-service-type)
-            ;; Installed but never auto-started: roguix-ssh-access starts it
+            (service omaguix-touch-id-service-type)
+            ;; Installed but never auto-started: omaguix-ssh-access starts it
             ;; for one boot when the launcher forwards SSH.
             (service openssh-service-type
                      (openssh-configuration
                       (%auto-start? #f)
                       (permit-root-login #f)))
-            (service roguix-ssh-access-service-type)
+            (service omaguix-ssh-access-service-type)
             ;; Omarchy's Docker: the daemon runs, but the account is not in the
             ;; docker group (root-equivalent), so the CLI runs under sudo.
             (service containerd-service-type)
@@ -257,25 +345,25 @@ first-start setup's answers (roguix-setup)."
             ;; Like the Arch guest, log straight in on the VM console: the disk
             ;; is protected by the Mac account. tty1 waits for the first-start
             ;; password prompt, then /etc/profile.d starts Hyprland there.
-            (simple-service 'roguix-session etc-profile-d-service-type
-                            (list roguix-session-script))
+            (simple-service 'omaguix-session etc-profile-d-service-type
+                            (list omaguix-session-script))
             (modify-services
                 (remove (lambda (service)
                           (memq (service-kind service)
                                 (list gdm-service-type sddm-service-type)))
                         %desktop-services)
-              ;; Roguix's own packages (Hyprland, Quickshell, Omarchy, the
+              ;; Omaguix's own packages (Hyprland, Quickshell, Omarchy, the
               ;; VM agents) have no substitutes on Guix's servers; its server
-              ;; publishes them, signed with roguix.frolow.dev.pub, after
-              ;; Guix's own servers in the search order.
+              ;; publishes them, signed with its key, after Guix's own
+              ;; servers in the search order ((omaguix trust)).
               (guix-service-type
                config => (guix-configuration
                           (inherit config)
                           (substitute-urls
                            (append (guix-configuration-substitute-urls config)
-                                   (list %roguix-substitute-url)))
+                                   (list (omaguix-trust-substitute-url %omaguix-trust))))
                           (authorized-keys
-                           (cons (local-file "roguix.frolow.dev.pub")
+                           (cons (omaguix-trust-substitute-key %omaguix-trust)
                                  (guix-configuration-authorized-keys config)))))
               ;; pipewire-pulse serves the PulseAudio socket; pactl (the audio
               ;; bridge's tool) must never start a real PulseAudio daemon.
@@ -293,13 +381,13 @@ first-start setup's answers (roguix-setup)."
                           (client-conf '((autospawn . no)))))
               (console-font-service-type
                config => (map (lambda (tty)
-                                (cons (car tty) %roguix-console-font))
+                                (cons (car tty) %omaguix-console-font))
                               config))
               (mingetty-service-type
                config => (if (string=? (mingetty-configuration-tty config) "tty1")
                              (mingetty-configuration
                               (inherit config)
-                              (auto-login %roguix-account)
+                              (auto-login %omaguix-account)
                               ;; The shared folder is mounted before the
                               ;; session starts, as in the Arch guest. The
                               ;; login also waits for Shepherd's elogind:
@@ -308,8 +396,16 @@ first-start setup's answers (roguix-setup)."
                               ;; and everything requiring elogind (pam, sshd)
                               ;; could no longer start.
                               (shepherd-requirement
-                               (cons* 'roguix-first-boot 'roguix-mac-share
+                               (cons* 'omaguix-first-boot 'omaguix-mac-share
+                                      'omaguix-machine-settings
                                       'elogind
                                       (mingetty-configuration-shepherd-requirement
                                        config))))
                              config)))))))
+
+;; The image's system with no extra packages and the default host settings,
+;; independent of any machine's settings file: what omaguix/omaguix's CI
+;; builds substitutes for, the same derivation wherever it is evaluated.
+;; Defined last: it calls the procedures above when the module loads.
+(define %omaguix-reference-system
+  (settings-operating-system '()))

@@ -1,4 +1,4 @@
-;;; Roguix — compositor packages newer than the pinned Guix checkout.
+;;; Omaguix — compositor packages newer than the pinned Guix checkout.
 ;;;
 ;;; The pinned checkout ships Hyprland 0.55.4 with Aquamarine 0.12.1, which
 ;;; cannot switch to a larger mode on virtio-gpu (see guest/guix/README.md).
@@ -9,7 +9,7 @@
 ;;; This file is project code, not part of the authenticated Guix channel: it is
 ;;; reviewed and committed like any other source. The build passes this
 ;;; directory with -L; the image also installs it for in-guest reconfigure.
-(define-module (roguix packages)
+(define-module (omaguix packages)
   #:use-module (guix packages)
   #:use-module (ice-9 match)
   #:use-module (guix download)
@@ -33,7 +33,7 @@
             aquamarine-0.14
             hyprland-0.56
             xdg-desktop-portal-hyprland-0.56
-            roguix-display-sync
+            omaguix-display-sync
             quickshell-0.3))
 
 ;; Hyprland 0.56 requires hyprutils >= 0.14.0; the Arch guest uses 0.14.2.
@@ -147,10 +147,14 @@
                (sha256
                 (base32
                  "0j85l7rvjsddzm1d99fnaqza6160zm1xx89r3385h0rnfyrnxcn5"))
-               ;; Byte-identical to guest/patches/hyprland (test_build.py).
+               ;; Pinned by SHA-256 in test_build.py. The second ends a
+               ;; screen capture of an output whose DPMS is off with
+               ;; `failed', as such an output commits no frame to copy.
                (patches
                 (list (local-file
-                       "hyprland-rounded-border-coverage.patch")))
+                       "hyprland-rounded-border-coverage.patch")
+                      (local-file
+                       "hyprland-capture-blanked-output.patch")))
                ;; truthy() tests a lowercased transform_view against string_view
                ;; prefixes; comparing its first prefix.size() elements is the
                ;; C++20 equivalent (a shorter input yields a shorter range).
@@ -194,21 +198,21 @@
 ;; fresh EDID and
 ;; applies a complete modeline through hyprctl on every DRM hotplug change.
 ;; It runs as a child of the Hyprland session, started from hypr-vm.lua.
-(define roguix-display-sync
+(define omaguix-display-sync
   (package
-    (name "roguix-display-sync")
+    (name "omaguix-display-sync")
     (version "1")
     (source (local-file "display-sync"))
     (build-system copy-build-system)
     (arguments
      (list
-      #:install-plan #~'(("display-sync" "bin/roguix-display-sync"))
+      #:install-plan #~'(("display-sync" "bin/omaguix-display-sync"))
       #:phases
       #~(modify-phases %standard-phases
           (add-after 'install 'wrap
             (lambda* (#:key inputs #:allow-other-keys)
               (let ((program (string-append #$output
-                                            "/bin/roguix-display-sync")))
+                                            "/bin/omaguix-display-sync")))
                 (chmod program #o555)
                 (wrap-program program
                   `("PATH" ":" prefix
