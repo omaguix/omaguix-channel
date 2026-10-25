@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""roguix-setup: Roguix's first-start setup on tty1, run as root.
+"""omaguix-setup: Omaguix's first-start setup on tty1, run as root.
 
 It asks in Omarchy's order (install/provisioning/setup-form.sh): keyboard
 layout, the password of the account, an optional Git name and email, the host
-name and the time zone. The Mac app suggests the keyboard layout and time zone
-through the launcher's settings (/run/roguix/host-settings).
+name and the time zone. The Mac app suggests the keyboard layout through the
+launcher's settings (/run/omaguix/host-settings). The time zone offers "Same
+as macOS" first, as Try Omarchy does: omaguix-timezone then follows the Mac's
+zone live, and any other choice fixes the zone. The system's
+language is the Mac's (tryomarchy.locale) without a question, set this once:
+later boots and Mac language changes leave the guest's choice alone.
 
-System values go into the setup block of /etc/config.scm, between its
-markers, and take effect at once for this boot; the Git identity goes into
-the account's ~/.gitconfig. A reconfigure started in the background makes
-the system values part of the system generation, so they survive a restart;
-a notification tells the account when it has finished.
+System values go into /var/lib/omaguix/machine-settings.scm, a data file
+that /etc/config.scm reads, and take effect at once; until a reconfigure
+builds them into the system, the omaguix-machine-settings service applies
+them at every boot, so the setup starts no reconfigure. The Git identity
+goes into the account's ~/.gitconfig.
 
 One process reads the terminal for every question, in raw mode set once
 and never flushed, so keys typed ahead of the next question are kept: with
 a separate gum process per question they were lost between questions. Each
 question announces itself on the serial console (/dev/hvc0, captured by the
-Mac app) as "roguix-setup: ready STEP", which end-to-end tests wait for.
+Mac app) as "omaguix-setup: ready STEP", which end-to-end tests wait for.
 """
 
 import base64
@@ -25,16 +29,17 @@ import pwd
 import re
 import select
 import signal
+import socket
 import subprocess
 import sys
 import termios
-import time
 
 ACCOUNT = "guest"
-CONFIG = "/etc/config.scm"
-HOST_SETTINGS = "/run/roguix/host-settings"
-BEGIN = ";; BEGIN roguix setup"
-END = ";; END roguix setup"
+MACHINE_SETTINGS = "/var/lib/omaguix/machine-settings.scm"
+HOST_SETTINGS = "/run/omaguix/host-settings"
+# The Mac's latest zone, which omaguix-timezone receives this boot.
+HOST_ZONE = "/run/omaguix/host-timezone"
+FOLLOW_MAC = "Same as macOS"
 
 
 def system_zoneinfo():
@@ -54,8 +59,6 @@ def system_zoneinfo():
 
 
 ZONEINFO = system_zoneinfo()
-RECONFIGURE = "/run/current-system/profile/bin/roguix-reconfigure"
-RECONFIGURE_LOG = "/var/log/roguix-setup-reconfigure.log"
 EVENTS = "/dev/hvc0"
 
 # (label, XKB layout, XKB variant, console keymap). XKB drives Guix's
@@ -103,6 +106,12 @@ LAYOUTS = (
     ("Ukrainian", "ua", "", "ua"),
 )
 
+# The Mac's language as the launcher passes it, and the Guix locale the image
+# defines for it (system.scm's locale definitions; artifact.LOCALES lists the
+# optional ones). Any other language keeps English.
+LOCALES = {"en_US.UTF-8": "en_US.utf8", "zh_TW.UTF-8": "zh_TW.utf8",
+           "zh_CN.UTF-8": "zh_CN.utf8", "ko_KR.UTF-8": "ko_KR.utf8"}
+
 HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 TIMEZONE = re.compile(r"^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$")
 
@@ -130,13 +139,23 @@ def suggested_layout(settings):
     return LAYOUTS[0]
 
 
-def suggested_timezone(settings):
-    encoded = settings.get("tryomarchy.timezone", "")
+def mac_timezone(settings, latest=None):
+    """The Mac's zone: the latest one omaguix-timezone received, else the
+    one the launcher passed at launch; None when unknown or invalid."""
     try:
-        zone = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
-    except (ValueError, UnicodeDecodeError):
-        return "Etc/UTC"
-    return zone if valid_timezone(zone) else "Etc/UTC"
+        with open(latest or HOST_ZONE, encoding="utf-8") as stream:
+            zone = stream.read().strip()
+    except OSError:
+        encoded = settings.get("tryomarchy.timezone", "")
+        try:
+            zone = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+        except (ValueError, UnicodeDecodeError):
+            return None
+    return zone if valid_timezone(zone) else None
+
+
+def suggested_locale(settings):
+    return LOCALES.get(settings.get("tryomarchy.locale", ""), "en_US.utf8")
 
 
 def valid_timezone(zone, zoneinfo=None):
@@ -147,28 +166,21 @@ def valid_timezone(zone, zoneinfo=None):
 def scheme_string(text):
     """A Scheme string literal for TEXT, already restricted to safe characters."""
     if not re.fullmatch(r"[A-Za-z0-9_+./-]*", text):
-        raise Failure(f"refusing to write {text!r} into {CONFIG}")
+        raise Failure(f"refusing to write {text!r} into {MACHINE_SETTINGS}")
     return '"' + text + '"'
 
 
-def setup_block(host_name, timezone, layout, variant):
-    lines = [BEGIN,
-             f" #:host-name {scheme_string(host_name)}",
-             f" #:timezone {scheme_string(timezone)}",
-             f" #:keyboard-layout {scheme_string(layout)}"]
-    if variant:
-        lines.append(f" #:keyboard-variant {scheme_string(variant)}")
-    lines.append(" " + END)
-    return "\n".join(lines)
-
-
-def with_setup(text, block):
-    """TEXT with its setup block replaced; the markers must be there once."""
-    if text.count(BEGIN) != 1 or text.count(END) != 1:
-        raise Failure(f"{CONFIG} has no single setup block; edit it by hand")
-    start = text.index(BEGIN)
-    end = text.index(END) + len(END)
-    return text[:start] + block.lstrip() + text[end:]
+def machine_settings(host_name, timezone, follows_mac, layout, locale):
+    """The machine settings file's text: data that /etc/config.scm, the
+    omaguix-machine-settings service and omaguix-timezone read, never load."""
+    _, xkb_layout, variant, keymap = layout
+    fields = (("host-name", host_name), ("timezone", timezone),
+              ("timezone-follows-mac", "yes" if follows_mac else "no"),
+              ("keyboard-layout", xkb_layout), ("keyboard-variant", variant),
+              ("console-keymap", keymap), ("locale", locale))
+    return (";; Written by omaguix-setup; read by /etc/config.scm and at boot.\n("
+            + "\n ".join(f"({key} . {scheme_string(value)})" for key, value in fields)
+            + ")\n")
 
 
 def _interrupt(number, frame):
@@ -183,7 +195,7 @@ class Terminal:
     is read as it is.
     """
 
-    TITLE = "Roguix: first start"
+    TITLE = "Omaguix: first start"
 
     def __init__(self, input_fd=0, output_fd=1, events=None):
         self.input = input_fd
@@ -225,7 +237,7 @@ class Terminal:
         if self.events is None:
             return
         try:
-            self.events.write(f"roguix-setup: {text}\n")
+            self.events.write(f"omaguix-setup: {text}\n")
             self.events.flush()
         except OSError:
             self.events = None
@@ -380,7 +392,7 @@ def ask_password(terminal):
 
 def ask_host_name(terminal):
     while True:
-        name = terminal.ask("host-name", "Host name", value="roguix")
+        name = terminal.ask("host-name", "Host name", value="omaguix")
         if HOSTNAME.match(name):
             return name
         problem = "Use lowercase letters, digits and inner hyphens (up to 63)."
@@ -401,9 +413,18 @@ def zones(zoneinfo=None):
     return sorted(set(found))
 
 
-def ask_timezone(terminal, suggestion):
-    chosen = terminal.choose("time-zone", "Time zone", zones(), suggestion)
-    return chosen if valid_timezone(chosen) else suggestion
+def ask_timezone(terminal, mac_zone):
+    """(zone, follows the Mac). With the Mac's zone known, "Same as macOS"
+    comes first and is preselected; choosing a zone fixes it, even the
+    Mac's own."""
+    if mac_zone is None:
+        chosen = terminal.choose("time-zone", "Time zone", zones(), "Etc/UTC")
+        return (chosen if valid_timezone(chosen) else "Etc/UTC"), False
+    chosen = terminal.choose("time-zone", "Time zone", [FOLLOW_MAC] + zones(),
+                             FOLLOW_MAC)
+    if chosen != FOLLOW_MAC and valid_timezone(chosen):
+        return chosen, False
+    return mac_zone, True
 
 
 def run(*command, **kwargs):
@@ -420,7 +441,7 @@ def apply_layout(entry):
 
 
 def replace_file(path, text):
-    staging = path + ".roguix-setup"
+    staging = path + ".omaguix-setup"
     with open(staging, "w", encoding="utf-8") as stream:
         stream.write(text)
     os.chmod(staging, 0o644)
@@ -444,118 +465,44 @@ def set_git_identity(name, email):
         os.chown(path, account.pw_uid, account.pw_gid)
 
 
-def apply_system(host_name, timezone):
+def renamed_hosts(text, previous, host_name):
+    """/etc/hosts TEXT with the host name PREVIOUS, as a whole word, renamed."""
+    return re.sub(rf"(?<![\w.-]){re.escape(previous)}(?![\w.-])", host_name, text)
+
+
+def with_language(environment, locale):
+    """/etc/environment's text ENVIRONMENT with LANG set to LOCALE."""
+    lines = [line for line in environment.splitlines()
+             if line and not line.startswith("LANG=")]
+    return "".join(f"{line}\n" for line in [f"LANG={locale}"] + lines)
+
+
+def apply_language(locale, environment="/etc/environment"):
+    # pam_env gives the login its LANG from here; the next reconfigure
+    # builds the same value from /etc/config.scm.
+    with open(environment, encoding="utf-8") as stream:
+        text = stream.read()
+    replace_file(environment, with_language(text, locale))
+
+
+def apply_system(host_name, timezone, hosts="/etc/hosts"):
+    previous = socket.gethostname()
     run("hostname", host_name)
+    # Keep /etc/hosts resolving the name, or sudo waits on DNS.
+    with open(hosts, encoding="utf-8") as stream:
+        text = stream.read()
+    replace_file(hosts, renamed_hosts(text, previous, host_name))
     zone = os.path.join(ZONEINFO, timezone)
-    staging = "/etc/localtime.roguix-setup"
+    staging = "/etc/localtime.omaguix-setup"
     if os.path.lexists(staging):
         os.remove(staging)
     os.symlink(zone, staging)
     os.replace(staging, "/etc/localtime")
 
 
-def session_bus(uid, proc="/proc"):
-    """The D-Bus session address of UID's desktop, or None.
-
-    The session runs under dbus-run-session, whose bus has a random path,
-    so it is read from the environment of the account's compositor.
-    """
-    for pid in os.listdir(proc):
-        if not pid.isdigit():
-            continue
-        try:
-            if os.stat(os.path.join(proc, pid)).st_uid != uid:
-                continue
-            with open(os.path.join(proc, pid, "comm")) as stream:
-                if stream.read().strip() != "Hyprland":
-                    continue
-            with open(os.path.join(proc, pid, "environ"), "rb") as stream:
-                variables = stream.read().split(b"\0")
-        except OSError:
-            continue
-        for variable in variables:
-            if variable.startswith(b"DBUS_SESSION_BUS_ADDRESS="):
-                return variable.split(b"=", 1)[1].decode()
-    return None
-
-
-def notify(summary, body, replaces=None, persistent=False):
-    """Show a desktop notification in the account's session.
-
-    Returns its id, which a later call passes as REPLACES to update it in
-    place, or None when the session is not up.
-    """
-    account = pwd.getpwnam(ACCOUNT)
-    bus = session_bus(account.pw_uid)
-    if bus is None:
-        return None
-    command = ["notify-send", "--app-name=Roguix", "--print-id"]
-    if replaces:
-        command.append(f"--replace-id={replaces}")
-    if persistent:
-        command.append("--expire-time=0")
-
-    def drop_privileges():
-        os.setgid(account.pw_gid)
-        os.initgroups(ACCOUNT, account.pw_gid)
-        os.setuid(account.pw_uid)
-
-    result = subprocess.run(
-        command + [summary, body], preexec_fn=drop_privileges,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        env=dict(os.environ, HOME=account.pw_dir,
-                 XDG_RUNTIME_DIR=f"/run/user/{account.pw_uid}",
-                 DBUS_SESSION_BUS_ADDRESS=bus))
-    identifier = result.stdout.strip()
-    return identifier if result.returncode == 0 and identifier.isdigit() else None
-
-
-def reconfigure_in_background():
-    """Apply /etc/config.scm in a process that outlives this setup.
-
-    The desktop starts meanwhile; once it is up, a notification says that
-    the settings already work but become permanent only when the
-    reconfigure ends, and the same notification then reports the result.
-    """
-    if os.fork() != 0:
-        return
-    try:
-        os.setsid()
-        if os.fork() != 0:
-            os._exit(0)
-        log = os.open(RECONFIGURE_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        null = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(null, 0)
-        os.dup2(log, 1)
-        os.dup2(log, 2)
-        environment = dict(os.environ, HOME="/root",
-                           PATH=os.environ.get("PATH", "") +
-                           ":/run/current-system/profile/bin"
-                           ":/run/current-system/profile/sbin")
-        process = subprocess.Popen([RECONFIGURE], env=environment)
-        notice = None
-        while process.poll() is None:
-            if notice is None:
-                notice = notify(
-                    "Applying your Roguix settings",
-                    "They work now. Keep Roguix running while it makes "
-                    "them permanent, up to half an hour.",
-                    persistent=True)
-            time.sleep(5)
-        if process.returncode == 0:
-            notify("Roguix settings applied",
-                   "Keyboard, time zone and host name now survive a restart.",
-                   replaces=notice)
-        else:
-            notify("Roguix settings not applied",
-                   f"They last until a restart; see {RECONFIGURE_LOG}.",
-                   replaces=notice, persistent=True)
-    finally:
-        os._exit(0)
-
-
 def ask_all(terminal, settings):
     """Every answer, in Omarchy's order; returns them once confirmed."""
+    locale = suggested_locale(settings)
     layout = ask_layout(terminal, suggested_layout(settings))
     apply_layout(layout)
     password = ask_password(terminal)
@@ -563,12 +510,14 @@ def ask_all(terminal, settings):
         name = terminal.ask("git-name", "Your name for Git commits (optional)")
         email = terminal.ask("git-email", "Your email for Git commits (optional)")
         host_name = ask_host_name(terminal)
-        timezone = ask_timezone(terminal, suggested_timezone(settings))
+        timezone, follows_mac = ask_timezone(terminal, mac_timezone(settings))
+        shown_zone = f"{FOLLOW_MAC} ({timezone})" if follows_mac else timezone
         summary = [f"Keyboard:  {layout[0]}", f"Host name: {host_name}",
-                   f"Time zone: {timezone}",
+                   f"Time zone: {shown_zone}", f"Language:  {locale} (the Mac's)",
                    f"Git:       {name or '-'} <{email or '-'}>"]
         if terminal.confirm("confirm", summary, "Save these settings?"):
-            return layout, password, name, email, host_name, timezone
+            return (layout, password, name, email, host_name, timezone,
+                    follows_mac, locale)
 
 
 def open_events():
@@ -584,20 +533,19 @@ def open_events():
 def main():
     settings = host_settings()
     with Terminal(events=open_events()) as terminal:
-        layout, password, name, email, host_name, timezone = ask_all(terminal, settings)
+        layout, password, name, email, host_name, timezone, follows_mac, locale = \
+            ask_all(terminal, settings)
         set_git_identity(name, email)
-        # The password last: until it is set, first boot runs this setup again.
-        with open(CONFIG, encoding="utf-8") as stream:
-            text = stream.read()
-        replace_file(CONFIG, with_setup(text, setup_block(host_name, timezone,
-                                                          layout[1], layout[2])))
+        os.makedirs(os.path.dirname(MACHINE_SETTINGS), mode=0o755, exist_ok=True)
+        replace_file(MACHINE_SETTINGS,
+                     machine_settings(host_name, timezone, follows_mac, layout,
+                                      locale))
         apply_system(host_name, timezone)
+        apply_language(locale)
+        # The password last: until it is set, first boot runs this setup again.
         set_password(password)
         terminal.event("finished")
-        reconfigure_in_background()
-        terminal.draw([f"Saved in {CONFIG}. Starting the desktop; the system",
-                       "applies the settings in the background and says when",
-                       "they survive a restart."])
+        terminal.draw([f"Saved in {MACHINE_SETTINGS}. Starting the desktop."])
     return 0
 
 
@@ -607,5 +555,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     except Failure as error:
-        print(f"roguix-setup: {error}", file=sys.stderr)
+        print(f"omaguix-setup: {error}", file=sys.stderr)
         sys.exit(1)
