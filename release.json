@@ -1,0 +1,36 @@
+{
+  "channel-commit": "3306d683143068b09ae844b7761d79c9ef22cb1e",
+  "try-omaguix-commit": "5689e27d675128bb77bfbeed252d035ffb5ffa95",
+  "guix-commit": "7e74121a40a8308166e328a23647cf6f3768e6c8",
+  "guix-fork": {
+    "url": "https://codeberg.org/rofrol/guix",
+    "commit": "df67948e48a270a7bc5b69451f998134641777b2"
+  },
+  "guix-patch": {
+    "file": "modules/omaguix/guix-skip-forward-check.patch",
+    "sha256": "b614c2c4b75d213d2169a9262ae0574ad03007a30eb6dd55626e1c981bd4b835"
+  },
+  "guix-patched-commit": "ad87b3d911dddfcce97f0622ffea24c34758ee60",
+  "ci": {
+    "repository": "omaguix/omaguix",
+    "run-id": 40248492447,
+    "url": "https://github.com/omaguix/omaguix/actions/runs/40248492447",
+    "commit": "de97e985eba36a69658fa3be622d8886f1e0f9da"
+  },
+  "architectures": {
+    "aarch64-linux": {
+      "guix": "/gnu/store/77bp0jlmr99malclg5mgy9iki47k7bbs-profile",
+      "release": "aarch64-desktop-20261026-de97e98-402484924471",
+      "published": 59,
+      "served-by-bordeaux": 933,
+      "served-by-omaguix": 59
+    },
+    "x86_64-linux": {
+      "guix": "/gnu/store/yiwwbp85ipy46lkcih4xa5f5ilnlyylf-profile",
+      "release": "x86_64-desktop-20261026-de97e98-402484924471",
+      "published": 59,
+      "served-by-bordeaux": 933,
+      "served-by-omaguix": 59
+    }
+  }
+}
